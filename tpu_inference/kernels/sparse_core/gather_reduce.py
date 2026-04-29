@@ -639,38 +639,62 @@ def sc_gather_reduce(
                                 enable_all_sublanes_mask,
                             )
 
-                    def get_val_weighted(idx):
-                        val = get_row_val(idx)
+                    row0 = get_row_val(0)
+                    if weights_local is not None:
+                        row0 = arith.mulf(row0, weights_vecs[0])
+                        if topk_wgt_zero_nan:
+                            row0 = arith.select(
+                                arith.cmpf(arith.CmpFPredicate.OEQ,
+                                           weights_vecs[0], zero_vec_f32),
+                                zero_vec_f32,
+                                row0,
+                            )
+
+                    row8 = get_row_val(8)
+                    if weights_local is not None:
+                        row8 = arith.mulf(row8, weights_vecs[8])
+                        if topk_wgt_zero_nan:
+                            row8 = arith.select(
+                                arith.cmpf(arith.CmpFPredicate.OEQ,
+                                           weights_vecs[8], zero_vec_f32),
+                                zero_vec_f32,
+                                row8,
+                            )
+
+                    for sum_idx in range(7):
+                        tmp_row0 = get_row_val(sum_idx + 1)
                         if weights_local is not None:
-                            val = arith.mulf(val, weights_vecs[idx])
+                            tmp_row0 = arith.mulf(tmp_row0,
+                                                  weights_vecs[sum_idx + 1])
                             if topk_wgt_zero_nan:
-                                val = arith.select(
-                                    arith.cmpf(arith.CmpFPredicate.OEQ,
-                                               weights_vecs[idx],
-                                               zero_vec_f32),
+                                tmp_row0 = arith.select(
+                                    arith.cmpf(
+                                        arith.CmpFPredicate.OEQ,
+                                        weights_vecs[sum_idx + 1],
+                                        zero_vec_f32,
+                                    ),
                                     zero_vec_f32,
-                                    val,
+                                    tmp_row0,
                                 )
-                        return val
 
-                    vals0 = [get_val_weighted(i) for i in range(8)]
-                    vals8 = [get_val_weighted(8 + i) for i in range(8)]
+                        row0 = arith.addf(row0, tmp_row0)
 
-                    def tree_reduce(vals):
-                        # Stride-based reduction for 8 elements to match JAX exactly
-                        # Level 1
-                        s1 = arith.addf(vals[0], vals[4])
-                        s2 = arith.addf(vals[1], vals[5])
-                        s3 = arith.addf(vals[2], vals[6])
-                        s4 = arith.addf(vals[3], vals[7])
-                        # Level 2
-                        s12 = arith.addf(s1, s3)
-                        s34 = arith.addf(s2, s4)
-                        # Level 3
-                        return arith.addf(s12, s34)
+                        tmp_row8 = get_row_val(8 + sum_idx + 1)
+                        if weights_local is not None:
+                            tmp_row8 = arith.mulf(
+                                tmp_row8, weights_vecs[8 + sum_idx + 1])
+                            if topk_wgt_zero_nan:
+                                tmp_row8 = arith.select(
+                                    arith.cmpf(
+                                        arith.CmpFPredicate.OEQ,
+                                        weights_vecs[8 + sum_idx + 1],
+                                        zero_vec_f32,
+                                    ),
+                                    zero_vec_f32,
+                                    tmp_row8,
+                                )
 
-                    row0 = tree_reduce(vals0)
-                    row8 = tree_reduce(vals8)
+                        row8 = arith.addf(row8, tmp_row8)
 
                     packed = tpu.pack_subelements(
                         _BF16[2, vreg_size],
