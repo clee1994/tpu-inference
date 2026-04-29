@@ -31,6 +31,7 @@ from torchax.interop import jax_view, torch_view
 from torchax.ops.mappings import TORCH_DTYPE_TO_JAX
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.forward_context import set_forward_context
+from vllm.ir import enable_torch_wrap
 from vllm.lora.layers import BaseLayerWithLoRA
 from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
 from vllm.model_executor.layers.pooler import Pooler
@@ -125,7 +126,6 @@ class VllmModelWrapper:
 
         self.vllm_config.quant_config = get_tpu_quantization_config(
             self.vllm_config, self.mesh)
-        self.model_config = vllm_config.speculative_config.draft_model_config if is_draft_model else vllm_config.model_config
         self._apply_pp_patch()
 
     def _apply_pp_patch(self):
@@ -214,9 +214,9 @@ class VllmModelWrapper:
 
         with load_context, jax_context, set_current_vllm_config(
                 self.vllm_config):
+            model_config_for_load = vllm_config_for_load.speculative_config.draft_model_config if self.is_draft_model else vllm_config_for_load.model_config
             vllm_model = vllm_get_model(vllm_config=vllm_config_for_load,
-                                        model_config=self.model_config)
-
+                                        model_config=model_config_for_load)
         lora_manager = None
         if vllm_config_for_load.lora_config is not None:
             # Replace layers in the model with LoRA layers.
@@ -260,6 +260,8 @@ class VllmModelWrapper:
 
         loading_end = time.time()
         total_loading_time = loading_end - loading_start
+        # Warning: Please DO NOT remove the below logging line.
+        # If you are making changes, inform/reach out to https://github.com/sethiay.
         logger.info(
             f"Total time to load model weights from storage to TPU: {total_loading_time:.2f} seconds."
         )
@@ -409,13 +411,14 @@ class VllmModelWrapper:
             **kwargs,
         ) -> Any:
 
-            def move(v: torch.Tensor) -> torch.Tensor:
-                if not isinstance(v, torch.Tensor):
-                    logger.warning(f"Expect torch.Tensor, got {type(v)}")
-                    return v
-                return v.to(device="jax")
+            with torchax.default_env(), enable_torch_wrap(False):
 
-            with torchax.default_env():
+                def move(v: torch.Tensor) -> torch.Tensor:
+                    if not isinstance(v, torch.Tensor):
+                        logger.warning(f"Expect torch.Tensor, got {type(v)}")
+                        return v
+                    return v.to(device="jax")
+
                 # Ensure all tensors are moved into accelerator so the
                 # computation with weights can work properly.
                 call_kwargs = {
@@ -455,6 +458,8 @@ class VllmModelWrapper:
                         torch_mm_embeds = [torch_view(x) for x in mm_embeds]
                     else:
                         torch_mm_embeds = torch_view(mm_embeds)
+                    assert is_multimodal is not None
+                    torch_mm_embeds = torch_mm_embeds[is_multimodal]
                     call_args = (torch_view(input_ids), torch_mm_embeds)
                 else:
                     call_args = (torch_view(input_ids), )

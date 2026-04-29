@@ -296,6 +296,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self._pre_async_results: AsyncPreResults | None = None
         self._substitute_placeholder_token_fn = _substitute_placeholder_token
         self.execute_model_state: ExecuteModelState | None = None
+        self.batch_counter = 0
 
         self.kv_caches: list[jax.Array] = []
         self.layer_name_to_kvcache_index: dict[str, int] = {}
@@ -546,21 +547,24 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
     def load_model(self):
         with set_current_vllm_config(self.vllm_config):
-            self.model_fn, self.compute_logits_fn, self.pooler_fn, self.combine_hidden_states_fn, multimodal_fns, self.state, self.lora_manager, self.model = get_model(
+            model = get_model(
                 self.vllm_config,
                 self.rng_key,
                 self.mesh,
             )
 
-        multimodal_fns = multimodal_fns or {}
-        self.precompile_vision_encoder_fn = multimodal_fns.get(
-            "precompile_vision_encoder_fn", None)
-        self.embed_multimodal_fn = multimodal_fns.get("embed_multimodal_fn",
-                                                      None)
-        self.embed_input_ids_fn = multimodal_fns.get("embed_input_ids_fn",
-                                                     None)
-        self.get_mrope_input_positions_fn = multimodal_fns.get(
-            "get_mrope_input_positions_fn", None)
+        self.model_fn = model.model_fn
+        self.compute_logits_fn = model.compute_logits_fn
+        self.pooler_fn = model.pooler_fn
+        self.combine_hidden_states_fn = model.combine_hidden_states_fn
+        self.state = model.state
+        self.lora_manager = model.lora_manager
+        self.model = model.model
+
+        self.precompile_vision_encoder_fn = model.multimodal_fns.precompile_vision_encoder_fn
+        self.embed_multimodal_fn = model.multimodal_fns.embed_multimodal_fn
+        self.embed_input_ids_fn = model.multimodal_fns.embed_input_ids_fn
+        self.get_mrope_input_positions_fn = model.multimodal_fns.get_mrope_input_positions_fn
 
         if self.drafter is not None:
             logger.info("Loading drafter model...")
@@ -608,6 +612,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
     def get_kv_cache_spec(self):
         return self.kv_cache_manager.get_kv_cache_spec()
+
+    def get_kv_cache_layout(self):
+        return self.kv_cache_manager.get_kv_cache_layout()
 
     def initialize_kv_cache(self,
                             kv_cache_config: KVCacheConfig,
@@ -1154,26 +1161,31 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                    scheduler_output: "VllmSchedulerOutput"):
 
         dp_size = self.dp_size
+        num_reqs = self.input_batch.num_reqs
         max_num_reqs_per_dp_rank = self.max_num_reqs // dp_size
-
-        req_ids_dp = scheduler_output.req_ids_per_rank
-        scheduled_tokens_per_dp_rank = scheduler_output.scheduled_tokens_per_rank
-
-        req_indices_dp = {
-            dp_rank: [
-                self.input_batch.req_id_to_index[req_id]
-                for req_id in req_ids_dp[dp_rank]
-            ]
-            for dp_rank in range(dp_size)
-        }
+        req_ids_dp = {dp_rank: [] for dp_rank in range(dp_size)}
+        req_indices_dp = {dp_rank: [] for dp_rank in range(dp_size)}
         num_scheduled_tokens_per_dp_rank = {
-            dp_rank: sum(scheduled_tokens_per_dp_rank[dp_rank])
+            dp_rank: 0
             for dp_rank in range(dp_size)
         }
-        num_req_per_dp_rank = {
-            dp_rank: len(req_ids_dp[dp_rank])
+        scheduled_tokens_per_dp_rank = {
+            dp_rank: []
             for dp_rank in range(dp_size)
         }
+        num_req_per_dp_rank = {dp_rank: 0 for dp_rank in range(dp_size)}
+
+        for req_id in self.input_batch.req_ids[:num_reqs]:
+            dp_rank = scheduler_output.assigned_dp_rank[req_id]
+            req_ids_dp[dp_rank].append(req_id)
+            req_indices_dp[dp_rank].append(
+                self.input_batch.req_id_to_index[req_id])
+            num_scheduled_tokens_per_dp_rank[
+                dp_rank] += scheduler_output.num_scheduled_tokens[req_id]
+            scheduled_tokens_per_dp_rank[dp_rank].append(
+                scheduler_output.num_scheduled_tokens[req_id])
+            num_req_per_dp_rank[dp_rank] += 1
+
         # Find maximum number of scheduled tokens across DP ranks
         max_num_scheduled_tokens_across_dp = max(
             num_scheduled_tokens_per_dp_rank.values())
@@ -1467,8 +1479,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         # Please see runner_utils.PhasedBasedProfiler for details
         if self.phase_based_profiler:
+            self.batch_counter += 1
             batch_composition_stats = runner_utils.get_batch_composition_stats(
-                self.input_batch, total_num_scheduled_tokens, num_reqs,
+                self.batch_counter, self.input_batch,
+                total_num_scheduled_tokens, num_reqs,
                 padded_total_num_scheduled_tokens, scheduler_output)
 
             self.phase_based_profiler.step(batch_composition_stats)
@@ -1662,8 +1676,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         # Please see runner_utils.PhasedBasedProfiler for details
         if self.phase_based_profiler:
+            self.batch_counter += 1
             batch_composition_stats = runner_utils.get_batch_composition_stats(
-                self.input_batch, total_num_scheduled_tokens, num_reqs,
+                self.batch_counter, self.input_batch,
+                total_num_scheduled_tokens, num_reqs,
                 padded_total_num_scheduled_tokens, scheduler_output)
 
             self.phase_based_profiler.step(batch_composition_stats)
