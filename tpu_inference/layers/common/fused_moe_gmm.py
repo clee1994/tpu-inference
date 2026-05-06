@@ -132,8 +132,7 @@ def moe_gmm_local(x: jax.Array, w1: jax.Array, w1_scale: jax.Array | None,
                   group_sizes: jax.Array, group_offset: jax.Array,
                   topk_argsort_revert_indices: jax.Array,
                   topk_weights: jax.Array, *, activation: str, topk: int,
-                  parallelism: Literal["tp", "ep"], sc_kernel_threshold: int,
-                  sc_kernel_col_chunk_size: int) -> jax.Array:
+                  parallelism: Literal["tp", "ep"]) -> jax.Array:
     """Main MoE logic on a local shard can run in TP or EP mode.
 
     Set parallelism for "tp" or "ep"
@@ -184,7 +183,7 @@ def moe_gmm_local(x: jax.Array, w1: jax.Array, w1_scale: jax.Array | None,
     chunk_size = max(lcm, (2048 + lcm // 2) // lcm * lcm)
 
     use_sc = gather_reduce_sc.is_supported_by_sc_gather_reduce(
-        gmm1_res.shape[0], sc_kernel_threshold, topk)
+        gmm1_res.shape[0], envs.SC_KERNEL_THRESHOLD, topk)
 
     if batch_size <= chunk_size:
         # Path 3: No pipeline at all no kernel
@@ -213,8 +212,16 @@ def moe_gmm_local(x: jax.Array, w1: jax.Array, w1_scale: jax.Array | None,
     # Pipelined paths
     if use_sc:
         # Path 1: Kernel pipeline
+        hidden_size = gmm2_res.shape[1]
+        i = math.ceil(hidden_size / 3584)
+        sc_kernel_col_chunk_size = 3584
+        for target_i in range(i, hidden_size + 1):
+            if hidden_size % target_i == 0:
+                sc_kernel_col_chunk_size = hidden_size // target_i
+                break
         sc_kernel_col_chunk_size = gather_reduce_sc.get_valid_col_chunk_size(
-            gmm2_res.shape[1], sc_kernel_col_chunk_size)
+            hidden_size, sc_kernel_col_chunk_size)
+
         if local_group_size < group_sizes.size:
             mask_flat = mask.reshape(-1, topk)
             topk_weights_sc = jnp.where(mask_flat, topk_weights, 0)
@@ -287,8 +294,6 @@ def tensor_parallel_gmm(
     activation: str,
     topk: int,
     mesh: Mesh,
-    sc_kernel_threshold: int,
-    sc_kernel_col_chunk_size: int,
 ) -> jax.Array:
     data_p_spec = P(ShardingAxisName.MLP_DATA)
     group_offset = jnp.array([0])
@@ -312,8 +317,6 @@ def tensor_parallel_gmm(
             activation=activation,
             topk=topk,
             parallelism="tp",
-            sc_kernel_threshold=sc_kernel_threshold,
-            sc_kernel_col_chunk_size=sc_kernel_col_chunk_size,
         ),
         mesh=mesh,
         in_specs=(
@@ -361,8 +364,6 @@ def expert_parallel_gmm(
     activation: str,
     topk: int,
     mesh: Mesh,
-    sc_kernel_threshold: int,
-    sc_kernel_col_chunk_size: int,
 ) -> jax.Array:
     ep_size = get_mesh_shape_product(mesh, ShardingAxisName.EXPERT)
     ep_p_spec = P(ShardingAxisName.EXPERT)
@@ -382,8 +383,6 @@ def expert_parallel_gmm(
             activation=activation,
             topk=topk,
             parallelism="ep",
-            sc_kernel_threshold=sc_kernel_threshold,
-            sc_kernel_col_chunk_size=sc_kernel_col_chunk_size,
         ),
         mesh=mesh,
         in_specs=(
@@ -446,8 +445,6 @@ def _apply_all_gather_fp8(hidden_states: jax.Array, mesh: Mesh,
     "use_ep",
     "activation",
     "scoring_fn",
-    "sc_kernel_threshold",
-    "sc_kernel_col_chunk_size",
     "all_gather_fp8",
 ))
 def fused_moe_func(
@@ -465,8 +462,6 @@ def fused_moe_func(
     use_ep: bool,
     activation: str,
     scoring_fn: str,
-    sc_kernel_threshold: int,
-    sc_kernel_col_chunk_size: int,
     all_gather_fp8: bool = False,
 ) -> jax.Array:
     """Route tokens in hidden_states into each experts based on routing.
@@ -598,8 +593,6 @@ def fused_moe_func(
             activation=activation,
             topk=topk,
             mesh=mesh,
-            sc_kernel_threshold=sc_kernel_threshold,
-            sc_kernel_col_chunk_size=sc_kernel_col_chunk_size,
         )
     else:
         x = tensor_parallel_gmm(
@@ -616,8 +609,6 @@ def fused_moe_func(
             activation=activation,
             topk=topk,
             mesh=mesh,
-            sc_kernel_threshold=sc_kernel_threshold,
-            sc_kernel_col_chunk_size=sc_kernel_col_chunk_size,
         )
 
     return x[:num_tokens, :hidden_size]
