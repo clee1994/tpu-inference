@@ -38,8 +38,6 @@ if TYPE_CHECKING:
     USE_BATCHED_RPA_KERNEL: bool = False
     FORCE_MOE_RANDOM_ROUTING: bool = False
     SC_KERNEL_THRESHOLD: int = 131072
-    SC_KERNEL_COL_CHUNK_SIZE: int = 3072
-    SC_PSUM_NUM_CHUNKS: int = 4
     JITTED_MM_MODULE_KEYS: list[str] = []
     REGISTER_MM_MODULE_CUSTOM_PYTREE_CLASSES: list[str] = []
     RAGGED_GATED_DELTA_RULE_IMPL: str = "ragged_gated_delta_rule_chunked"
@@ -248,8 +246,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("FORCE_MOE_RANDOM_ROUTING", default=False),
     "SC_KERNEL_THRESHOLD":
     lambda: int(os.getenv("SC_KERNEL_THRESHOLD") or "131072"),
-    "SC_KERNEL_COL_CHUNK_SIZE":
-    lambda: int(os.getenv("SC_KERNEL_COL_CHUNK_SIZE") or "3072"),
     "JITTED_MM_MODULE_KEYS":
     env_str_list("JITTED_MM_MODULE_KEYS"),
     "REGISTER_MM_MODULE_CUSTOM_PYTREE_CLASSES":
@@ -262,8 +258,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
                      ]),
     "MOE_ALL_GATHER_ACTIVATION_DTYPE":
     lambda: os.getenv("MOE_ALL_GATHER_ACTIVATION_DTYPE", ""),
-    "SC_PSUM_NUM_CHUNKS":
-    lambda: int(os.getenv("SC_PSUM_NUM_CHUNKS") or "4"),
     # Override cache_config.mamba_ssm_cache_dtype on TPU. Default "bfloat16"
     # halves SSM state HBM; set "float32" to opt out, "" to defer to vLLM.
     # TODO: remove once vLLM MambaDType includes bfloat16
