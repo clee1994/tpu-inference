@@ -143,8 +143,7 @@ def moe_gmm_local(
     topk: int,
     parallelism: Literal["tp", "ep"],
     sc_kernel_threshold: int,
-    sc_kernel_col_chunk_size: int,
-    sc_psum_num_chunks: int,
+    sc_kernel_col_chunk_size: int
 ) -> jax.Array:
     """Main MoE logic on a local shard can run in TP or EP mode.
 
@@ -196,7 +195,9 @@ def moe_gmm_local(
     if use_sc:
         sc_kernel_col_chunk_size = gather_reduce_sc.get_valid_col_chunk_size(
             gmm2_res.shape[1], sc_kernel_col_chunk_size)
-        chunk_size = batch_size // sc_psum_num_chunks
+        import math
+        lcm = (128 * topk) // math.gcd(128, topk)
+        chunk_size = max(lcm, (2048 + lcm // 2) // lcm * lcm)
 
         if local_group_size < group_sizes.size:
             mask_flat = mask.reshape(-1, topk)
@@ -208,7 +209,7 @@ def moe_gmm_local(
 
         topk_weights_flat = topk_weights_sc.flatten()
     else:
-        chunk_size = 16384
+        chunk_size = (2048 + topk // 2) // topk * topk
 
         if local_group_size < group_sizes.size:
             group_offsets = jnp.cumulative_sum(group_sizes,
@@ -278,7 +279,6 @@ def tensor_parallel_gmm(
     mesh: Mesh,
     sc_kernel_threshold: int,
     sc_kernel_col_chunk_size: int,
-    sc_psum_num_chunks: int,
 ) -> jax.Array:
     data_p_spec = P(ShardingAxisName.MLP_DATA)
     group_offset = jnp.array([0])
@@ -304,7 +304,6 @@ def tensor_parallel_gmm(
             parallelism="tp",
             sc_kernel_threshold=sc_kernel_threshold,
             sc_kernel_col_chunk_size=sc_kernel_col_chunk_size,
-            sc_psum_num_chunks=sc_psum_num_chunks,
         ),
         mesh=mesh,
         in_specs=(
@@ -354,7 +353,6 @@ def expert_parallel_gmm(
     mesh: Mesh,
     sc_kernel_threshold: int,
     sc_kernel_col_chunk_size: int,
-    sc_psum_num_chunks: int,
 ) -> jax.Array:
     ep_size = get_mesh_shape_product(mesh, ShardingAxisName.EXPERT)
     ep_p_spec = P(ShardingAxisName.EXPERT)
@@ -376,7 +374,6 @@ def expert_parallel_gmm(
             parallelism="ep",
             sc_kernel_threshold=sc_kernel_threshold,
             sc_kernel_col_chunk_size=sc_kernel_col_chunk_size,
-            sc_psum_num_chunks=sc_psum_num_chunks,
         ),
         mesh=mesh,
         in_specs=(
@@ -442,7 +439,6 @@ def _apply_all_gather_fp8(hidden_states: jax.Array, mesh: Mesh,
     "sc_kernel_threshold",
     "sc_kernel_col_chunk_size",
     "all_gather_fp8",
-    "sc_psum_num_chunks",
 ))
 def fused_moe_func(
     hidden_states: jax.Array,
@@ -461,7 +457,6 @@ def fused_moe_func(
     scoring_fn: str,
     sc_kernel_threshold: int,
     sc_kernel_col_chunk_size: int,
-    sc_psum_num_chunks: int,
     all_gather_fp8: bool = False,
 ) -> jax.Array:
     """Route tokens in hidden_states into each experts based on routing.
@@ -595,7 +590,6 @@ def fused_moe_func(
             mesh=mesh,
             sc_kernel_threshold=sc_kernel_threshold,
             sc_kernel_col_chunk_size=sc_kernel_col_chunk_size,
-            sc_psum_num_chunks=sc_psum_num_chunks,
         )
     else:
         x = tensor_parallel_gmm(
@@ -614,7 +608,6 @@ def fused_moe_func(
             mesh=mesh,
             sc_kernel_threshold=sc_kernel_threshold,
             sc_kernel_col_chunk_size=sc_kernel_col_chunk_size,
-            sc_psum_num_chunks=sc_psum_num_chunks,
         )
 
     return x[:num_tokens, :hidden_size]
