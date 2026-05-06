@@ -190,15 +190,38 @@ def moe_gmm_local(
     reduction_axis = (ShardingAxisName.MLP_TENSOR
                       if parallelism == "tp" else ShardingAxisName.EXPERT)
 
+    import math
+    lcm = (128 * topk) // math.gcd(128, topk)
+    chunk_size = max(lcm, (2048 + lcm // 2) // lcm * lcm)
+
     use_sc = gather_reduce_sc.is_supported_by_sc_gather_reduce(
         gmm1_res.shape[0], sc_kernel_threshold, topk)
+
+    if batch_size <= chunk_size:
+        # Path 3: No pipeline at all no kernel
+        if local_group_size < group_sizes.size:
+            group_offsets = jnp.cumulative_sum(group_sizes, include_initial=True)
+            experts_start = group_offset[0]
+            experts_end = group_offset[0] + local_group_size
+            shard_output_start = group_offsets[experts_start]
+            shard_output_end = group_offsets[experts_end]
+            token_hidden_full = ragged_scatter(gmm2_res, topk_argsort_revert_indices, shard_output_start, shard_output_end)
+        else:
+            token_hidden_full = gmm2_res[topk_argsort_revert_indices]
+        
+        cur_sorted = token_hidden_full.reshape((-1, topk, gmm2_res.shape[-1]))
+        cur_topk_weights = jnp.expand_dims(topk_weights, axis=-1)
+        cur_weighted = cur_sorted * cur_topk_weights
+        cur_masked = jnp.where(mask, cur_weighted, 0.0)
+        cur_reduced = cur_masked.sum(axis=-2)
+        out = jax.lax.psum(cur_reduced, axis_name=reduction_axis)
+        return out
+
+    # Pipelined paths
     if use_sc:
+        # Path 1: Kernel pipeline
         sc_kernel_col_chunk_size = gather_reduce_sc.get_valid_col_chunk_size(
             gmm2_res.shape[1], sc_kernel_col_chunk_size)
-        import math
-        lcm = (128 * topk) // math.gcd(128, topk)
-        chunk_size = max(lcm, (2048 + lcm // 2) // lcm * lcm)
-
         if local_group_size < group_sizes.size:
             mask_flat = mask.reshape(-1, topk)
             topk_weights_sc = jnp.where(mask_flat, topk_weights, 0)
@@ -206,23 +229,16 @@ def moe_gmm_local(
         else:
             topk_weights_sc = topk_weights
             topk_wgt_zero_nan = False
-
         topk_weights_flat = topk_weights_sc.flatten()
     else:
-        chunk_size = (2048 + topk // 2) // topk * topk
-
+        # Path 2: No kernel pipeline
         if local_group_size < group_sizes.size:
-            group_offsets = jnp.cumulative_sum(group_sizes,
-                                               include_initial=True)
+            group_offsets = jnp.cumulative_sum(group_sizes, include_initial=True)
             experts_start = group_offset[0]
             experts_end = group_offset[0] + local_group_size
             shard_output_start = group_offsets[experts_start]
             shard_output_end = group_offsets[experts_end]
-
-            token_hidden_full = ragged_scatter(gmm2_res,
-                                               topk_argsort_revert_indices,
-                                               shard_output_start,
-                                               shard_output_end)
+            token_hidden_full = ragged_scatter(gmm2_res, topk_argsort_revert_indices, shard_output_start, shard_output_end)
         else:
             token_hidden_full = gmm2_res[topk_argsort_revert_indices]
 
@@ -231,26 +247,19 @@ def moe_gmm_local(
         end = min(batch_size, start + chunk_size)
         start_tok = start // topk
         end_tok = end // topk
-
         cur_indices = topk_argsort_revert_indices[start:end]
 
         if use_sc:
             cur_weights = topk_weights_flat[start:end].reshape(-1, 128)
             cur_reduced = gather_reduce_sc.sc_gather_reduce(
-                op=gmm2_res,
-                idx=cur_indices,
-                reduce_group_size=topk,
-                topk_weights=cur_weights,
-                col_chunk_size=sc_kernel_col_chunk_size,
+                op=gmm2_res, idx=cur_indices, reduce_group_size=topk,
+                topk_weights=cur_weights, col_chunk_size=sc_kernel_col_chunk_size,
                 topk_wgt_zero_nan=topk_wgt_zero_nan,
             )
         else:
             cur_topk_weights = topk_weights[start_tok:end_tok]
             cur_mask = mask[start_tok:end_tok]
-
-            cur_sorted = token_hidden_full[start:end].reshape(
-                (-1, topk, gmm2_res.shape[-1]))
-
+            cur_sorted = token_hidden_full[start:end].reshape((-1, topk, gmm2_res.shape[-1]))
             cur_topk_weights = jnp.expand_dims(cur_topk_weights, axis=-1)
             cur_weighted = cur_sorted * cur_topk_weights
             cur_masked = jnp.where(cur_mask, cur_weighted, 0.0)
